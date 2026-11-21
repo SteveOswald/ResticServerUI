@@ -1,0 +1,51 @@
+# Restic REST Server + Benutzerverwaltung
+#
+#   restic-Clients ──► ui:8000 (Gateway: Auth + Freigaben) ──► rest-server:8000 (nur intern)
+#   Browser        ──► ui:8080 (Weboberfläche)
+#
+# rest-server läuft immer mit --private-repos und vertraut dem Benutzernamen
+# aus dem Header, den nur das Gateway setzt. rest-server ist deshalb nur im
+# internen Netzwerk erreichbar und veröffentlicht KEINE Ports.
+
+services:
+  rest-server:
+    image: restic/rest-server:0.14.0
+    restart: unless-stopped
+    user: "${PUID:-568}:${PGID:-568}"
+    environment:
+      OPTIONS: "--private-repos --proxy-auth-username ${PROXY_AUTH_HEADER:-X-Restic-User} ${REST_SERVER_EXTRA_OPTIONS:-}"
+    volumes:
+      - ${DATA_PATH:-./data}:/data
+    networks:
+      - backend
+
+  ui:
+    image: ${UI_IMAGE:-restic-server-ui:latest}
+    build: .
+    restart: unless-stopped
+    user: "${PUID:-568}:${PGID:-568}"
+    depends_on:
+      - rest-server
+    environment:
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      BACKEND_URL: http://rest-server:8000
+      PROXY_AUTH_HEADER: ${PROXY_AUTH_HEADER:-X-Restic-User}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      LOG_REQUESTS: ${LOG_REQUESTS:-false}
+      TZ: ${TZ:-Europe/Berlin}
+    volumes:
+      - ${CONFIG_PATH:-./config}:/config
+      - ${DATA_PATH:-./data}:/data:ro # nur lesend, für Größen-/Snapshot-Statistik
+    ports:
+      - "${GATEWAY_PORT:-8000}:8000" # für restic-Clients
+      - "${UI_PORT:-8080}:8080"      # Weboberfläche
+    networks:
+      - backend
+      - frontend
+
+networks:
+  backend:
+    internal: true
+  frontend: {}
