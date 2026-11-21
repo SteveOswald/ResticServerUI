@@ -233,6 +233,7 @@ const ROUTES = {
   users: { title: 'Benutzer', admin: true, render: renderUsers },
   shares: { title: 'Freigaben', admin: true, render: renderShares },
   repos: { title: 'Repositories', admin: true, render: renderRepos },
+  tls: { title: 'TLS', admin: true, render: renderTLS },
   account: { title: 'Mein Konto', admin: false, render: renderAccount },
 };
 
@@ -556,6 +557,198 @@ async function renderRepos(main, force) {
         h('td', { class: 'nowrap', title: fmtDate(r.lastSnapshot) }, fmtAgo(r.lastSnapshot)),
         h('td', { class: 'num' }, r.locks ? h('span', { class: 'badge append-only', title: 'Aktive oder verwaiste Locks' }, r.locks) : '0')))))) :
       h('div', { class: 'empty' }, 'Noch keine Repositories vorhanden. Sie entstehen mit „restic init“.')));
+}
+
+// ------------------------------------------------------------------ tls
+
+const CAS = {
+  production: "Let's Encrypt (Produktion)",
+  staging: "Let's Encrypt Staging (nur zum Testen – Browser vertrauen diesen Zertifikaten nicht)",
+  custom: 'Andere ACME-CA (eigene Verzeichnis-URL)',
+};
+
+let tlsPoll = null;
+
+function tlsStatusView(d) {
+  const s = d.status;
+  const c = s.cert;
+  const days = c ? Math.floor((new Date(c.notAfter).getTime() - Date.now()) / 864e5) : null;
+  let state = h('span', { class: 'badge off' }, 'Aus');
+  if (s.active) state = h('span', { class: 'badge full' }, 'Aktiv');
+  else if (s.enabled) state = h('span', { class: 'badge append-only' }, 'Wartet auf Zertifikat');
+  const run = s.lastRun;
+  return [
+    s.external ? h('div', { class: 'callout' },
+      'TLS wird über die Umgebungsvariablen ', h('code', {}, 'TLS_CERT'), ' / ', h('code', {}, 'TLS_KEY'),
+      ' gesteuert. Die Einstellungen unten sind in diesem Modus ohne Wirkung. Entferne die Variablen, um Let’s Encrypt zu nutzen.') : null,
+    h('div', { class: 'stats' },
+      h('div', { class: 'stat' }, h('div', { class: 'label' }, 'TLS'), h('div', { class: 'value' }, state)),
+      stat('Zertifikat gültig bis', c ? `${fmtDate(c.notAfter)}` : '–'),
+      stat('Verbleibend', c ? (days < 0 ? 'abgelaufen' : `${days} Tage`) : '–'),
+      stat('Aussteller', c ? c.issuer : '–')),
+    c ? h('p', { class: 'hint' }, 'Domains im Zertifikat: ', c.domains.map((n, i) => [i ? ', ' : '', h('code', {}, n)]),
+      s.external ? null : ` · automatische Erneuerung ab ${fmtDate(c.renewAfter)}`) : null,
+    s.needsIssue && !s.running ? h('div', { class: 'callout warn' }, s.needsIssue + ' ',
+      s.nextAttempt ? `Nächster automatischer Versuch: ${fmtDate(s.nextAttempt)}.` : 'Ein Zertifikat wird angefordert, sobald die Einstellungen vollständig sind.') : null,
+    s.running ? h('div', { class: 'callout' }, 'Zertifikat wird angefordert … (kann einige Minuten dauern)') : null,
+    run && !s.running && !run.ok ? h('div', { class: 'callout warn' }, 'Letzte Anforderung fehlgeschlagen: ', run.error) : null,
+    run && run.ok && !s.running ? h('div', { class: 'callout' }, `Letzte Anforderung erfolgreich (${fmtDate(run.finished)}).`) : null,
+    run ? h('details', { open: s.running || !run.ok }, h('summary', {}, `Protokoll der letzten Anforderung (${run.trigger}, ${fmtDate(run.started)})`),
+      h('pre', { class: 'snippet log' }, (run.log || []).join('\n') || '…')) : null,
+  ];
+}
+
+async function renderTLS(main) {
+  clearTimeout(tlsPoll);
+  const data = await api('GET', '/tls');
+  const statusHost = h('div', {});
+  const draw = (d) => setContent(statusHost, tlsStatusView(d));
+  draw(data);
+  const schedule = () => {
+    clearTimeout(tlsPoll);
+    tlsPoll = setTimeout(async () => {
+      if (!document.body.contains(statusHost)) return;
+      try {
+        const d = await api('GET', '/tls');
+        const wasActive = data.status.active;
+        draw(d);
+        data.status = d.status;
+        if (d.status.active && !wasActive) tlsActiveHint(d);
+        if (d.status.running) schedule();
+      } catch (_) {
+        // Most likely TLS has just been switched on and this page is still plain HTTP.
+        if (document.body.contains(statusHost)) tlsActiveHint(data, true);
+      }
+    }, 3000);
+  };
+  if (data.status.running) schedule();
+
+  const f = data.config;
+  const p = f.powerdns;
+  const ext = data.status.external;
+  const customUrl = h('input', { type: 'text', name: 'customDirectory', value: f.customDirectory || '', placeholder: 'https://acme.example.com/directory', spellcheck: 'false' });
+  const customField = h('label', { class: 'field', hidden: f.ca !== 'custom' }, h('span', {}, 'ACME-Verzeichnis-URL'), customUrl);
+  const caSel = h('select', { name: 'ca', onchange: (e) => { customField.hidden = e.target.value !== 'custom'; } },
+    Object.entries(CAS).map(([k, v]) => h('option', { value: k, selected: k === f.ca }, v)));
+
+  const err = h('p', { class: 'error-text', hidden: true });
+  const form = h('form', { onsubmit: (e) => e.preventDefault() });
+  const readForm = () => {
+    const fd = new FormData(form);
+    const num = (k) => parseInt(fd.get(k), 10) || 0;
+    return {
+      enabled: fd.get('enabled') === 'on',
+      domains: String(fd.get('domains')).split(/[\s,;]+/).filter(Boolean),
+      email: fd.get('email'),
+      ca: fd.get('ca'),
+      customDirectory: fd.get('customDirectory'),
+      acceptTos: fd.get('acceptTos') === 'on',
+      renewBeforeDays: num('renewBeforeDays'),
+      powerdns: {
+        url: fd.get('pdnsUrl'), apiKey: fd.get('pdnsKey'), serverId: fd.get('pdnsServer'), zone: fd.get('pdnsZone'),
+        ttl: num('pdnsTtl'), propagationSeconds: num('pdnsWait'), dnsServer: fd.get('pdnsDns'),
+      },
+    };
+  };
+  const busy = (btn, on) => { for (const b of form.querySelectorAll('button')) b.disabled = on; if (btn) btn.dataset.busy = on ? '1' : ''; };
+  const run = (btn, fn) => async () => {
+    err.hidden = true;
+    busy(btn, true);
+    try { await fn(); } catch (ex) { err.textContent = ex.message; err.hidden = false; err.scrollIntoView({ block: 'nearest' }); } finally { busy(btn, false); }
+  };
+  const save = async () => {
+    const d = await api('PUT', '/tls', readForm());
+    data.status = d.status;
+    data.apiKeySet = d.apiKeySet;
+    form.querySelector('[name=pdnsKey]').value = '';
+    return d;
+  };
+
+  const saveBtn = h('button', { type: 'button', class: 'primary' }, 'Speichern');
+  saveBtn.onclick = run(saveBtn, async () => {
+    const d = await save();
+    draw(d); schedule();
+    toast('Gespeichert');
+  });
+  const issueBtn = h('button', { type: 'button' }, 'Speichern & Zertifikat jetzt anfordern');
+  issueBtn.onclick = run(issueBtn, async () => {
+    await save();
+    const d = await api('POST', '/tls/issue');
+    draw(d); schedule();
+    toast('Zertifikatsanforderung gestartet');
+  });
+  const checkBtn = h('button', { type: 'button' }, 'DNS-Zugriff testen');
+  checkBtn.onclick = run(checkBtn, async () => {
+    const res = await api('POST', '/tls/check', readForm());
+    const ok = res.domains.every((x) => !x.error);
+    openDialog({
+      title: ok ? 'PowerDNS-Zugriff funktioniert' : 'PowerDNS-Zugriff: Probleme gefunden',
+      submitLabel: 'Schließen', noCancel: true,
+      body: [h('p', { class: 'hint' }, 'Die API ist erreichbar und der Key wird akzeptiert. Für jede Domain wurde die Zone ermittelt, in der der Eintrag _acme-challenge angelegt wird.'),
+        h('div', { class: 'table-wrap' }, h('table', {}, h('tbody', {}, res.domains.map((x) => h('tr', {},
+          h('td', {}, h('code', {}, x.domain)),
+          h('td', {}, x.error ? h('span', { class: 'badge off' }, x.error) : h('span', { class: 'badge full' }, 'Zone ' + x.zone)))))))],
+    });
+  });
+
+  const field = (label, input, hint) => h('label', { class: 'field' }, h('span', {}, label), input, hint ? h('small', {}, hint) : null);
+  const text = (name, value, extra) => h('input', { type: 'text', name, value: value ?? '', spellcheck: 'false', autocomplete: 'off', ...extra });
+
+  setContent(form,
+    err,
+    h('fieldset', { class: 'plain', disabled: ext },
+      h('div', { class: 'grid-2' },
+        h('div', {},
+          h('h2', {}, 'Zertifikat'),
+          h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'enabled', checked: f.enabled }),
+            h('span', {}, h('strong', {}, 'TLS aktivieren'), ' – Weboberfläche und restic-Gateway werden verschlüsselt')),
+          field('Domains', h('textarea', { name: 'domains', rows: 3, spellcheck: 'false', placeholder: 'backup.example.com' }, (f.domains || []).join('\n')),
+            'Eine pro Zeile. Wildcards wie *.example.com sind möglich (DNS-Challenge). Ein Zertifikat gilt für beide Ports.'),
+          field('E-Mail-Adresse', text('email', f.email, { type: 'text', placeholder: 'admin@example.com' }),
+            'Für Ablaufwarnungen der Zertifizierungsstelle (empfohlen).'),
+          field('Zertifizierungsstelle', caSel), customField,
+          h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'acceptTos', checked: f.acceptTos }),
+            h('span', {}, 'Ich akzeptiere die Nutzungsbedingungen der Zertifizierungsstelle ',
+              h('a', { href: 'https://letsencrypt.org/repository/', target: '_blank', rel: 'noopener noreferrer' }, '(Let’s Encrypt Subscriber Agreement)'))),
+          field('Erneuern, wenn weniger als … Tage gültig', text('renewBeforeDays', f.renewBeforeDays, { type: 'text', inputmode: 'numeric' }),
+            'Let’s Encrypt-Zertifikate sind 90 Tage gültig; die Erneuerung läuft automatisch im Hintergrund.')),
+        h('div', {},
+          h('h2', {}, 'DNS-Challenge über PowerDNS'),
+          field('API-URL', text('pdnsUrl', p.url, { placeholder: 'http://pdns:8081' }), 'Basis-Adresse der PowerDNS-Authoritative-API (webserver + api aktiviert).'),
+          field('API-Key', h('input', { type: 'password', name: 'pdnsKey', autocomplete: 'new-password', placeholder: data.apiKeySet ? '•••••••• (gespeichert – leer lassen zum Behalten)' : '' }),
+            'Wert von api-key in pdns.conf. Wird im Konfigurationsverzeichnis gespeichert und nie wieder angezeigt.'),
+          h('div', { class: 'grid-2' },
+            field('Server-ID', text('pdnsServer', p.serverId, { placeholder: 'localhost' })),
+            field('Zone (optional)', text('pdnsZone', p.zone, { placeholder: 'automatisch' }))),
+          h('div', { class: 'grid-2' },
+            field('TTL der TXT-Einträge (s)', text('pdnsTtl', p.ttl, { inputmode: 'numeric' })),
+            field('Wartezeit auf DNS (s)', text('pdnsWait', p.propagationSeconds, { inputmode: 'numeric' }))),
+          field('DNS-Server für Vorabprüfung (optional)', text('pdnsDns', p.dnsServer, { placeholder: 'ns1.example.com oder 192.0.2.53:53' }),
+            'Wenn angegeben, wartet die Anforderung, bis die TXT-Einträge dort sichtbar sind. Am besten ein autoritativer Nameserver der Zone.')))),
+    h('div', { class: 'actions' }, saveBtn, issueBtn, checkBtn));
+
+  setContent(main,
+    pageHead('TLS / Let’s Encrypt', 'Verschlüsselt die Weboberfläche und die Verbindung der restic-Clients mit einem automatisch erneuerten Zertifikat.'),
+    h('div', { class: 'card' }, h('div', { class: 'card-body' }, statusHost)),
+    h('div', { class: 'card' }, h('div', { class: 'card-body' },
+      h('div', { class: 'callout' },
+        'Ablauf: Für jede Domain wird per PowerDNS-API ein TXT-Eintrag ', h('code', {}, '_acme-challenge.<domain>'),
+        ' gesetzt, von Let’s Encrypt geprüft und danach wieder entfernt. Es muss kein Port aus dem Internet erreichbar sein. ',
+        'Erst wenn ein Zertifikat vorliegt, schaltet der Server um: Danach sind beide Ports nur noch per HTTPS erreichbar – restic-Clients benötigen ',
+        h('code', {}, 'rest:https://…'), '.'),
+      form)));
+}
+
+function tlsActiveHint(d, connectionLost) {
+  const dom = (d.config.domains || []).find((n) => !n.startsWith('*.')) || (d.status.cert && d.status.cert.domains[0]);
+  const url = dom ? `https://${dom}${location.port ? ':' + location.port : ''}/` : null;
+  openDialog({
+    title: connectionLost ? 'Verbindung unterbrochen – TLS ist vermutlich aktiv' : 'TLS ist jetzt aktiv',
+    submitLabel: 'Schließen', noCancel: true,
+    body: [h('p', {}, 'Neue Verbindungen werden verschlüsselt. Diese Seite ist noch über HTTP geladen – öffne die Oberfläche künftig über HTTPS:'),
+      url ? codeBox(url) : null,
+      h('p', { class: 'hint' }, 'Passe auch die URLs in deinen restic-Clients an (rest:https://…). Bei Problemen kann die Datei tls.json im Konfigurationsverzeichnis gelöscht werden – dann läuft nach einem Neustart alles wieder unverschlüsselt.')],
+  });
 }
 
 // ------------------------------------------------------------------ account

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,6 +23,7 @@ import (
 	"restic-server-ui/internal/gateway"
 	"restic-server-ui/internal/repos"
 	"restic-server-ui/internal/store"
+	"restic-server-ui/internal/tlsmgr"
 	"restic-server-ui/internal/web"
 )
 
@@ -70,7 +72,6 @@ func run() error {
 	dataDir := env("DATA_DIR", "/data")
 	header := env("PROXY_AUTH_HEADER", "X-Restic-User")
 	tlsCert, tlsKey := env("TLS_CERT", ""), env("TLS_KEY", "")
-	useTLS := tlsCert != "" && tlsKey != ""
 
 	backend, err := url.Parse(env("BACKEND_URL", "http://rest-server:8000"))
 	if err != nil || backend.Scheme == "" || backend.Host == "" {
@@ -89,6 +90,25 @@ func run() error {
 		return err
 	}
 
+	// TLS: certificates come from Let's Encrypt (configured in the admin UI) or,
+	// optionally, from fixed files given by TLS_CERT/TLS_KEY.
+	tlsm, err := tlsmgr.New(configDir)
+	if err != nil {
+		return fmt.Errorf("tls: %w", err)
+	}
+	if (tlsCert == "") != (tlsKey == "") {
+		return errors.New("TLS_CERT and TLS_KEY must be set together")
+	}
+	if tlsCert != "" {
+		if err := tlsm.LoadStatic(tlsCert, tlsKey); err != nil {
+			return fmt.Errorf("load TLS_CERT/TLS_KEY: %w", err)
+		}
+		log.Printf("tls: using fixed certificate from %s", tlsCert)
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	go tlsm.Run(ctx)
+
 	limiter := auth.NewLimiter(10, 15*time.Minute)
 	scanner := repos.NewScanner(dataDir, 2*time.Minute)
 	if !scanner.Enabled() {
@@ -98,9 +118,11 @@ func run() error {
 	gw := gateway.New(st, backend, header, limiter, envBool("LOG_REQUESTS", false))
 	ui := web.New(web.Config{
 		PublicURL:    strings.TrimRight(env("PUBLIC_URL", ""), "/"),
-		CookieSecure: envBool("COOKIE_SECURE", useTLS),
+		CookieSecure: envBool("COOKIE_SECURE", false),
 		SessionTTL:   ttl,
 		Version:      version,
+		GatewayPort:  portOf(gwAddr),
+		TLS:          tlsm,
 	}, st, scanner, limiter)
 
 	servers := []*http.Server{
@@ -110,18 +132,15 @@ func run() error {
 	errc := make(chan error, len(servers))
 	for i, srv := range servers {
 		name := []string{"restic gateway", "web ui"}[i]
-		if useTLS {
-			srv.TLSConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+		ln, err := net.Listen("tcp", srv.Addr)
+		if err != nil {
+			return fmt.Errorf("%s: %w", name, err)
 		}
+		log.Printf("%s listening on %s (tls=%v)", name, srv.Addr, tlsm.Active())
+		// The listener switches to TLS as soon as a certificate is active, so
+		// enabling TLS in the admin UI needs no restart.
 		go func() {
-			log.Printf("%s listening on %s (tls=%v)", name, srv.Addr, useTLS)
-			var err error
-			if useTLS {
-				err = srv.ListenAndServeTLS(tlsCert, tlsKey)
-			} else {
-				err = srv.ListenAndServe()
-			}
-			if !errors.Is(err, http.ErrServerClosed) {
+			if err := srv.Serve(tlsm.Listener(ln)); !errors.Is(err, http.ErrServerClosed) {
 				errc <- fmt.Errorf("%s: %w", name, err)
 			}
 		}()
@@ -189,28 +208,38 @@ func bootstrapAdmin(st *store.Store) error {
 	return nil
 }
 
+// portOf returns the port of a listen address like ":8000" or "0.0.0.0:8000".
+func portOf(addr string) string {
+	if _, p, err := net.SplitHostPort(addr); err == nil {
+		return p
+	}
+	return ""
+}
+
+// healthcheck asks the UI on localhost. Whether TLS is active can change at
+// runtime (admin UI), so try https first and fall back to plain http.
 func healthcheck() int {
 	addr := env("UI_LISTEN", ":8080")
 	if strings.HasPrefix(addr, ":") {
 		addr = "127.0.0.1" + addr
 	}
-	scheme := "http"
-	if env("TLS_CERT", "") != "" && env("TLS_KEY", "") != "" {
-		scheme = "https"
-	}
 	client := &http.Client{
 		Timeout:   5 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, // localhost only
 	}
-	resp, err := client.Get(scheme + "://" + addr + "/healthz")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		return 1
+	var lastErr error
+	for _, scheme := range []string{"https", "http"} {
+		resp, err := client.Get(scheme + "://" + addr + "/healthz")
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusOK {
+			return 0
+		}
+		lastErr = fmt.Errorf("status %d", resp.StatusCode)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		fmt.Fprintln(os.Stderr, "status", resp.StatusCode)
-		return 1
-	}
-	return 0
+	fmt.Fprintln(os.Stderr, lastErr)
+	return 1
 }

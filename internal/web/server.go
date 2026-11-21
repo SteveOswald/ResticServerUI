@@ -17,6 +17,7 @@ import (
 	"restic-server-ui/internal/auth"
 	"restic-server-ui/internal/repos"
 	"restic-server-ui/internal/store"
+	"restic-server-ui/internal/tlsmgr"
 )
 
 //go:embed static
@@ -26,9 +27,11 @@ const cookieName = "rsui_session"
 
 type Config struct {
 	PublicURL    string // URL of the restic gateway as seen by clients
-	CookieSecure bool
+	CookieSecure bool   // force the Secure flag (e.g. behind a TLS terminating proxy)
 	SessionTTL   time.Duration
 	Version      string
+	GatewayPort  string          // port of the restic gateway, for the displayed URLs
+	TLS          *tlsmgr.Manager // optional; enables the TLS settings API
 }
 
 type Server struct {
@@ -62,6 +65,11 @@ func New(cfg Config, st *store.Store, sc *repos.Scanner, limiter *auth.Limiter) 
 	mux.HandleFunc("DELETE /api/shares/{id}", s.withAdmin(s.deleteShare))
 
 	mux.HandleFunc("GET /api/repos", s.withAdmin(s.listRepos))
+
+	mux.HandleFunc("GET /api/tls", s.withAdmin(s.getTLS))
+	mux.HandleFunc("PUT /api/tls", s.withAdmin(s.putTLS))
+	mux.HandleFunc("POST /api/tls/issue", s.withAdmin(s.issueTLS))
+	mux.HandleFunc("POST /api/tls/check", s.withAdmin(s.checkTLS))
 
 	static, _ := fs.Sub(staticFS, "static")
 	mux.Handle("GET /", http.FileServerFS(static))
@@ -192,11 +200,18 @@ func toDTO(u store.User) userDTO {
 
 // ---------------------------------------------------------------- session API
 
-func (s *Server) setCookie(w http.ResponseWriter, value string, maxAge int) {
+func (s *Server) setCookie(w http.ResponseWriter, r *http.Request, value string, maxAge int) {
 	http.SetCookie(w, &http.Cookie{
 		Name: cookieName, Value: value, Path: "/", MaxAge: maxAge,
-		HttpOnly: true, Secure: s.cfg.CookieSecure, SameSite: http.SameSiteStrictMode,
+		HttpOnly: true, Secure: s.cfg.CookieSecure || r.TLS != nil, SameSite: http.SameSiteStrictMode,
 	})
+}
+
+func (s *Server) publicURL() string {
+	if s.cfg.TLS == nil {
+		return s.cfg.PublicURL
+	}
+	return s.cfg.TLS.AdjustPublicURL(s.cfg.PublicURL, s.cfg.GatewayPort)
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -224,7 +239,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	s.limiter.Reset(key)
 	tok := s.sessions.create(u.Name)
-	s.setCookie(w, tok, int(s.cfg.SessionTTL.Seconds()))
+	s.setCookie(w, r, tok, int(s.cfg.SessionTTL.Seconds()))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -232,14 +247,14 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 	if c, err := r.Cookie(cookieName); err == nil {
 		s.sessions.drop(c.Value)
 	}
-	s.setCookie(w, "", -1)
+	s.setCookie(w, r, "", -1)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request, u store.User, _ string) {
 	resp := map[string]any{
 		"user":        toDTO(u),
-		"publicUrl":   s.cfg.PublicURL,
+		"publicUrl":   s.publicURL(),
 		"version":     s.cfg.Version,
 		"dataEnabled": s.scanner.Enabled(),
 		"grants":      s.store.GrantsFor(u.Name),

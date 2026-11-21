@@ -11,7 +11,8 @@ Repositories anderer Benutzer zugreifen (nur lesen, nur anhängen oder voll).
 - Freigaben pro Benutzer oder pro Unter-Repository (`/alice/` oder `/alice/laptop/`)
 - Übersicht über Repositories: Größe, Anzahl Snapshots, letzter Snapshot, Locks
 - Normale Benutzer können sich anmelden, ihre Zugangs-URLs sehen und ihr Passwort ändern
-- Ein einziges Go-Binary ohne externe Abhängigkeiten, Image auf Basis von distroless (~10 MB)
+- Ein einziges Go-Binary (nur `golang.org/x/crypto/acme` als Abhängigkeit), Image auf Basis von distroless (~10 MB)
+- Optional TLS für Oberfläche und Gateway mit Let's Encrypt (DNS-Challenge über PowerDNS), komplett in der Oberfläche konfigurierbar
 
 ## Architektur
 
@@ -117,12 +118,68 @@ networks:
   frontend: {}
 ```
 
-Für HTTPS den Gateway-Port (8000) und die Oberfläche (8080) hinter einen Reverse
-Proxy hängen (z. B. Nginx Proxy Manager, Traefik, Caddy). Dann `COOKIE_SECURE=true`
-und `PUBLIC_URL=https://…` setzen. Alternativ direkt `TLS_CERT`/`TLS_KEY` angeben.
+Für HTTPS gibt es zwei Wege: das eingebaute Let's-Encrypt-TLS (Abschnitt
+[TLS / Let's Encrypt](#tls--lets-encrypt)) oder ein vorgeschalteter Reverse Proxy
+(z. B. Nginx Proxy Manager, Traefik, Caddy) – dann `COOKIE_SECURE=true` und
+`PUBLIC_URL=https://…` setzen.
 
 > **Wichtig:** Den Port des rest-server-Containers niemals veröffentlichen. Wer
 > rest-server direkt erreicht, kann den Header fälschen und so jedes Repository lesen.
+
+## TLS / Let's Encrypt
+
+Weboberfläche (`:8080`) **und** restic-Gateway (`:8000`) können direkt im Container
+per TLS abgesichert werden. Das Zertifikat kommt von Let's Encrypt (oder einer
+anderen ACME-CA) und wird per **DNS-01-Challenge über die PowerDNS-API** ausgestellt –
+es muss also kein Port aus dem Internet erreichbar sein, und Wildcards
+(`*.example.com`) sind möglich. Alles wird in der Oberfläche unter **TLS** eingestellt:
+
+| Einstellung | Bedeutung |
+|-------------|-----------|
+| Domains | Eine pro Zeile, auch `*.example.com`. Ein Zertifikat gilt für beide Ports. |
+| E-Mail, Zertifizierungsstelle | Let's Encrypt *Produktion*, *Staging* (zum Testen, Zertifikate sind nicht vertrauenswürdig) oder eigene ACME-URL. Nutzungsbedingungen müssen akzeptiert werden. |
+| PowerDNS API-URL / API-Key | z. B. `http://pdns:8081` und der `api-key` aus `pdns.conf` |
+| Server-ID, Zone | `localhost` ist üblich. Die Zone wird je Domain automatisch ermittelt (längste passende Zone), kann aber festgelegt werden. |
+| TTL, Wartezeit, DNS-Server | TTL der TXT-Einträge, Mindestwartezeit vor der Prüfung; optional ein Nameserver, auf dem die Einträge sichtbar sein müssen, bevor Let's Encrypt prüft. |
+
+Ablauf: Pro Domain wird `_acme-challenge.<domain>` per `PATCH /api/v1/servers/<id>/zones/<zone>`
+als TXT-Eintrag gesetzt, validiert und anschließend wieder gelöscht. **DNS-Zugriff testen**
+prüft API-URL, Key und Zonen, ohne etwas zu ändern. Das Zertifikat wird 30 Tage (einstellbar)
+vor Ablauf automatisch erneuert; bei Fehlern wird mit wachsendem Abstand (1 h … 12 h)
+erneut versucht, das Protokoll des letzten Laufs steht in der Oberfläche.
+
+Wichtig zu wissen:
+
+- **Umschalten ohne Neustart:** TLS wird erst aktiv, wenn ein Zertifikat vorliegt. Danach sind
+  beide Ports **nur noch per HTTPS** erreichbar (HTTP-Anfragen werden mit 400 abgelehnt).
+  Bereits offene Verbindungen bleiben bis zu ihrem Ende unverschlüsselt.
+  restic-Clients müssen auf `rest:https://…` umgestellt werden; die in der Oberfläche
+  angezeigten URLs passen sich an (bei gesetzter `PUBLIC_URL` mit `http://` wird die erste
+  Domain bzw. derselbe Host mit `https://` verwendet).
+- Der Hostname, unter dem Clients und Browser den Server erreichen, muss im Zertifikat
+  stehen und auf den Server zeigen.
+- Der Container braucht ausgehenden Zugriff auf die ACME-CA (HTTPS) und auf die PowerDNS-API.
+- Der PowerDNS-API-Key ist nicht auf eine Zone beschränkt – die API nur im internen Netz
+  erreichbar machen. Der Key liegt im Klartext in `CONFIG_DIR/tls.json` (Rechte `0600`),
+  ebenso wie der ACME-Konto- und der Zertifikatsschlüssel in `CONFIG_DIR/tls/`. Die Oberfläche
+  zeigt den Key nie wieder an; leer lassen heißt „unverändert“.
+- Wird ein TXT-Eintrag per CNAME woandershin delegiert, funktioniert das Setzen über die API
+  nicht – `_acme-challenge.<domain>` muss direkt in einer PowerDNS-Zone liegen. Vorhandene
+  TXT-Einträge unter diesem Namen werden beim Setzen ersetzt und danach entfernt.
+- **Notausstieg**, falls man sich ausgesperrt hat: `tls.json` im Konfigurationsverzeichnis
+  löschen und neu starten – danach läuft alles wieder unverschlüsselt (oder `TLS_CERT`/`TLS_KEY`
+  setzen).
+- Feste Zertifikate (`TLS_CERT`/`TLS_KEY`) funktionieren weiterhin und haben Vorrang.
+
+Beispiel für `pdns.conf` (API nur im internen Docker-Netz erreichbar machen):
+
+```ini
+api=yes
+api-key=<langer-zufälliger-schlüssel>
+webserver=yes
+webserver-address=0.0.0.0
+webserver-allow-from=<Netz der UI, z. B. 172.16.0.0/12>
+```
 
 ## Konfiguration (Umgebungsvariablen des `ui`-Containers)
 
@@ -134,11 +191,11 @@ und `PUBLIC_URL=https://…` setzen. Alternativ direkt `TLS_CERT`/`TLS_KEY` ange
 | `PUBLIC_URL`           | `<host der UI>:8000`        | Gateway-Adresse für die angezeigten Repository-URLs |
 | `BACKEND_URL`          | `http://rest-server:8000`   | Interne Adresse des rest-servers |
 | `PROXY_AUTH_HEADER`    | `X-Restic-User`             | Muss zu `--proxy-auth-username` passen |
-| `CONFIG_DIR`           | `/config`                   | Enthält `users.json` (Benutzer, Hashes, Freigaben) |
+| `CONFIG_DIR`           | `/config`                   | Enthält `users.json` (Benutzer, Hashes, Freigaben) sowie `tls.json` und `tls/` (TLS-Einstellungen, Zertifikat, Schlüssel) |
 | `DATA_DIR`             | `/data`                     | rest-server-Daten (read-only) für die Statistik; optional |
 | `UI_LISTEN` / `GATEWAY_LISTEN` | `:8080` / `:8000`   | Listen-Adressen |
-| `TLS_CERT` / `TLS_KEY` | –                           | Optional: TLS direkt im Container |
-| `COOKIE_SECURE`        | `true` bei TLS              | Secure-Flag für das Session-Cookie |
+| `TLS_CERT` / `TLS_KEY` | –                           | Optional: festes Zertifikat (PEM). Hat Vorrang vor Let's Encrypt; die TLS-Einstellungen in der Oberfläche sind dann gesperrt |
+| `COOKIE_SECURE`        | `false`                     | Secure-Flag für das Session-Cookie erzwingen. Bei TLS im Container wird es automatisch gesetzt; nur nötig, wenn ein Reverse Proxy TLS terminiert |
 | `SESSION_TTL`          | `12h`                       | Gültigkeit einer Anmeldung |
 | `LOG_REQUESTS`         | `false`                     | Jede restic-Anfrage loggen |
 
@@ -156,8 +213,12 @@ und `PUBLIC_URL=https://…` setzen. Alternativ direkt `TLS_CERT`/`TLS_KEY` ange
 ## Entwicklung
 
 ```bash
-go test ./...            # Unit- und API-Tests (Go ≥ 1.24, nur Standardbibliothek)
+go test ./...            # Unit- und API-Tests (Go ≥ 1.24; einzige Abhängigkeit: golang.org/x/crypto/acme)
 go run .                 # UI auf :8080, Gateway auf :8000, CONFIG_DIR/DATA_DIR per Env setzen
 ```
 
 Ohne lokales Go: `docker run --rm -v "$PWD:/src" -w /src golang:1.25-alpine go test ./...`
+
+Der Test `internal/tlsmgr/e2e_test.go` (Build-Tag `e2e`) stellt ein Zertifikat gegen einen
+echten [Pebble](https://github.com/letsencrypt/pebble)-ACME-Server und ein echtes PowerDNS aus;
+Voraussetzungen stehen im Kopf der Datei.
