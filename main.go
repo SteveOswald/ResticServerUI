@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"errors"
 	"fmt"
 	"log"
@@ -68,6 +67,8 @@ func main() {
 func run() error {
 	uiAddr := env("UI_LISTEN", ":8080")
 	gwAddr := env("GATEWAY_LISTEN", ":8000")
+	uiTLSAddr := env("UI_TLS_LISTEN", ":8443")
+	gwTLSAddr := env("GATEWAY_TLS_LISTEN", ":8444")
 	configDir := env("CONFIG_DIR", "/config")
 	dataDir := env("DATA_DIR", "/data")
 	header := env("PROXY_AUTH_HEADER", "X-Restic-User")
@@ -117,31 +118,54 @@ func run() error {
 
 	gw := gateway.New(st, backend, header, limiter, envBool("LOG_REQUESTS", false))
 	ui := web.New(web.Config{
-		PublicURL:    strings.TrimRight(env("PUBLIC_URL", ""), "/"),
-		CookieSecure: envBool("COOKIE_SECURE", false),
-		SessionTTL:   ttl,
-		Version:      version,
-		GatewayPort:  portOf(gwAddr),
-		TLS:          tlsm,
+		PublicURL:      strings.TrimRight(env("PUBLIC_URL", ""), "/"),
+		CookieSecure:   envBool("COOKIE_SECURE", false),
+		SessionTTL:     ttl,
+		Version:        version,
+		GatewayPort:    portOf(gwAddr),
+		GatewayTLSPort: portOf(gwTLSAddr),
+		UITLSPort:      portOf(uiTLSAddr),
+		TLS:            tlsm,
 	}, st, scanner, limiter)
 
-	servers := []*http.Server{
-		{Addr: gwAddr, Handler: gw, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute},
-		{Addr: uiAddr, Handler: ui, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 2 * time.Minute},
+	// Separate ports for HTTP and HTTPS. The listeners follow the TLS state
+	// at runtime, so enabling TLS in the admin UI needs no restart:
+	//   - gateway, HTTP : bound only while TLS is NOT active (released afterwards)
+	//   - gateway, HTTPS: bound only while TLS is active
+	//   - web UI, HTTP  : always bound; redirects to HTTPS while TLS is active
+	//   - web UI, HTTPS : bound only while TLS is active
+	gwSrv := func() *http.Server {
+		return &http.Server{ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 5 * time.Minute}
 	}
-	errc := make(chan error, len(servers))
-	for i, srv := range servers {
-		name := []string{"restic gateway", "web ui"}[i]
-		ln, err := net.Listen("tcp", srv.Addr)
+	uiSrv := func() *http.Server {
+		return &http.Server{ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 2 * time.Minute}
+	}
+	type listenerSpec struct {
+		name   string
+		addr   string
+		listen func(string) (net.Listener, error)
+		srv    *http.Server
+		h      http.Handler
+	}
+	specs := []listenerSpec{
+		{"restic gateway (http)", gwAddr, tlsm.ListenPlain, gwSrv(), tlsm.DenyPlain(gw)},
+		{"restic gateway (https)", gwTLSAddr, tlsm.ListenTLS, gwSrv(), gw},
+		{"web ui (http)", uiAddr, func(a string) (net.Listener, error) { return net.Listen("tcp", a) }, uiSrv(), tlsm.RedirectToHTTPS(ui, portOf(uiTLSAddr))},
+		{"web ui (https)", uiTLSAddr, tlsm.ListenTLS, uiSrv(), ui},
+	}
+	var servers []*http.Server
+	errc := make(chan error, len(specs))
+	for _, sp := range specs {
+		ln, err := sp.listen(sp.addr)
 		if err != nil {
-			return fmt.Errorf("%s: %w", name, err)
+			return fmt.Errorf("%s: %w", sp.name, err)
 		}
-		log.Printf("%s listening on %s (tls=%v)", name, srv.Addr, tlsm.Active())
-		// The listener switches to TLS as soon as a certificate is active, so
-		// enabling TLS in the admin UI needs no restart.
+		sp.srv.Addr, sp.srv.Handler = sp.addr, sp.h
+		servers = append(servers, sp.srv)
+		log.Printf("%s configured on %s (tls active=%v)", sp.name, sp.addr, tlsm.Active())
 		go func() {
-			if err := srv.Serve(tlsm.Listener(ln)); !errors.Is(err, http.ErrServerClosed) {
-				errc <- fmt.Errorf("%s: %w", name, err)
+			if err := sp.srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+				errc <- fmt.Errorf("%s: %w", sp.name, err)
 			}
 		}()
 	}
@@ -216,30 +240,26 @@ func portOf(addr string) string {
 	return ""
 }
 
-// healthcheck asks the UI on localhost. Whether TLS is active can change at
-// runtime (admin UI), so try https first and fall back to plain http.
+// healthcheck asks the plain-HTTP UI port on localhost. That port is always
+// bound, and /healthz is exempt from the redirect to HTTPS.
 func healthcheck() int {
 	addr := env("UI_LISTEN", ":8080")
 	if strings.HasPrefix(addr, ":") {
 		addr = "127.0.0.1" + addr
 	}
 	client := &http.Client{
-		Timeout:   5 * time.Second,
-		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}, // localhost only
+		Timeout:       5 * time.Second,
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	var lastErr error
-	for _, scheme := range []string{"https", "http"} {
-		resp, err := client.Get(scheme + "://" + addr + "/healthz")
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
-			return 0
-		}
-		lastErr = fmt.Errorf("status %d", resp.StatusCode)
+	resp, err := client.Get("http://" + addr + "/healthz")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
 	}
-	fmt.Fprintln(os.Stderr, lastErr)
-	return 1
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "status %d\n", resp.StatusCode)
+		return 1
+	}
+	return 0
 }

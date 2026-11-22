@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -68,6 +67,7 @@ type Manager struct {
 	static   *tls.Certificate
 	staticCI *CertInfo
 	running  bool
+	changed  chan struct{} // closed (and reset) when the TLS state changes, see Changed
 	last     *RunInfo
 	failures int
 	next     time.Time
@@ -144,6 +144,7 @@ func (m *Manager) LoadStatic(certFile, keyFile string) error {
 	}
 	m.mu.Lock()
 	m.static, m.staticCI = &crt, info
+	m.notifyLocked()
 	m.mu.Unlock()
 	return nil
 }
@@ -167,7 +168,7 @@ func (m *Manager) getCertificate(*tls.ClientHelloInfo) (*tls.Certificate, error)
 	switch {
 	case m.static != nil:
 		return m.static, nil
-	case m.cert != nil:
+	case m.cfg.Enabled && m.cert != nil:
 		return m.cert, nil
 	}
 	return nil, errors.New("kein Zertifikat vorhanden")
@@ -180,30 +181,6 @@ func (m *Manager) TLSConfig() *tls.Config {
 		GetCertificate: m.getCertificate,
 		NextProtos:     []string{"h2", "http/1.1"},
 	}
-}
-
-// Listener wraps l: connections accepted while TLS is active are upgraded to
-// TLS, all others stay plain. Enabling or disabling TLS therefore needs no
-// restart; established connections are not affected.
-func (m *Manager) Listener(l net.Listener) net.Listener {
-	return &dynListener{Listener: l, m: m, cfg: m.TLSConfig()}
-}
-
-type dynListener struct {
-	net.Listener
-	m   *Manager
-	cfg *tls.Config
-}
-
-func (l *dynListener) Accept() (net.Conn, error) {
-	c, err := l.Listener.Accept()
-	if err != nil {
-		return nil, err
-	}
-	if l.m.Active() {
-		return tls.Server(c, l.cfg), nil
-	}
-	return c, nil
 }
 
 // ---------------------------------------------------------------- settings
@@ -244,6 +221,7 @@ func (m *Manager) SetConfig(c Config) error {
 	m.cfg = c
 	m.next = time.Time{}
 	m.failures = 0
+	m.notifyLocked()
 	m.mu.Unlock()
 	if c.Enabled {
 		m.maybeIssue("Einstellungen geändert")
@@ -446,6 +424,7 @@ func (m *Manager) install(cfg Config, res *issued) error {
 	}
 	m.mu.Lock()
 	m.cert, m.info = &crt, info
+	m.notifyLocked()
 	m.mu.Unlock()
 	return nil
 }
@@ -512,44 +491,51 @@ func HostMatches(name, host string) bool {
 	return false
 }
 
-// AdjustPublicURL turns the configured gateway address into one that works
-// while TLS is active. gatewayPort is the port the gateway listens on.
-func (m *Manager) AdjustPublicURL(raw, gatewayPort string) string {
+// certNames returns the names of the certificate in use.
+func (m *Manager) certNames() (active bool, names []string) {
 	m.mu.RLock()
-	active := m.activeLocked()
-	var names []string
+	defer m.mu.RUnlock()
 	switch {
 	case m.static != nil:
 		names = m.staticCI.Domains
 	case m.info != nil:
 		names = m.info.Domains
 	}
-	m.mu.RUnlock()
-	if !active || strings.HasPrefix(raw, "https://") {
-		return raw
+	return m.activeLocked(), names
+}
+
+// CertHost returns the host name browsers and clients should use while TLS is
+// active: host itself if the certificate covers it, otherwise the first
+// non-wildcard certificate name, otherwise host unchanged.
+func (m *Manager) CertHost(host string) string {
+	_, names := m.certNames()
+	for _, n := range names {
+		if HostMatches(n, host) {
+			return host
+		}
 	}
-	if raw == "" {
-		return "" // the UI derives the address from the page it was loaded from
+	for _, n := range names {
+		if !strings.HasPrefix(n, "*.") {
+			return n
+		}
+	}
+	return host
+}
+
+// AdjustPublicURL turns the configured gateway address into one that works
+// while TLS is active: https, a host covered by the certificate, and
+// tlsPort, the port of the HTTPS gateway listener.
+func (m *Manager) AdjustPublicURL(raw, tlsPort string) string {
+	active, _ := m.certNames()
+	if !active || raw == "" || strings.HasPrefix(raw, "https://") {
+		// raw == "": the UI derives the address from the page it was loaded from
+		return raw
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
 		return raw
 	}
-	for _, n := range names {
-		if HostMatches(n, u.Hostname()) {
-			u.Scheme = "https"
-			return strings.TrimRight(u.String(), "/")
-		}
-	}
-	for _, n := range names {
-		if !strings.HasPrefix(n, "*.") {
-			host := n
-			if gatewayPort != "" && gatewayPort != "443" {
-				host = net.JoinHostPort(n, gatewayPort)
-			}
-			return "https://" + host
-		}
-	}
 	u.Scheme = "https"
+	u.Host = joinHostPort(m.CertHost(u.Hostname()), tlsPort)
 	return strings.TrimRight(u.String(), "/")
 }

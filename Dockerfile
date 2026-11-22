@@ -16,7 +16,9 @@ COPY --from=build /out/restic-server-ui /restic-server-ui
 ENV CONFIG_DIR=/config \
     DATA_DIR=/data \
     UI_LISTEN=:8080 \
-    GATEWAY_LISTEN=:8000
-EXPOSE 8000 8080
+    GATEWAY_LISTEN=:8000 \
+    UI_TLS_LISTEN=:8443 \
+    GATEWAY_TLS_LISTEN=:8444
+EXPOSE 8000 8080 8443 8444
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s CMD ["/restic-server-ui", "healthcheck"]
 ENTRYPOINT ["/restic-server-ui"]

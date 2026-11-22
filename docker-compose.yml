@@ -1,7 +1,10 @@
 # Restic REST Server + Benutzerverwaltung
 #
-#   restic-Clients ──► ui:8000 (Gateway: Auth + Freigaben) ──► rest-server:8000 (nur intern)
-#   Browser        ──► ui:8080 (Weboberfläche)
+#   restic-Clients ──► ui:8000 http / ui:8444 https (Gateway: Auth + Freigaben) ──► rest-server:8000 (nur intern)
+#   Browser        ──► ui:8080 http / ui:8443 https (Weboberfläche)
+#
+# Mit aktivem TLS: 8080 leitet auf 8443 um, 8000 wird geschlossen, 8443/8444 sind offen.
+# Ohne TLS: 8080 und 8000 sind offen, 8443/8444 sind geschlossen.
 #
 # rest-server läuft immer mit --private-repos und vertraut dem Benutzernamen
 # aus dem Header, den nur das Gateway setzt. rest-server ist deshalb nur im
@@ -31,6 +34,8 @@ services:
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
       PUBLIC_URL: ${PUBLIC_URL:-}
       BACKEND_URL: http://rest-server:8000
+      UI_TLS_LISTEN: ":${UI_TLS_PORT:-8443}"
+      GATEWAY_TLS_LISTEN: ":${GATEWAY_TLS_PORT:-8444}"
       PROXY_AUTH_HEADER: ${PROXY_AUTH_HEADER:-X-Restic-User}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
       LOG_REQUESTS: ${LOG_REQUESTS:-false}
@@ -39,8 +44,12 @@ services:
       - ${CONFIG_PATH:-./config}:/config
       - ${DATA_PATH:-./data}:/data:ro # nur lesend, für Größen-/Snapshot-Statistik
     ports:
-      - "${GATEWAY_PORT:-8000}:8000" # für restic-Clients
-      - "${UI_PORT:-8080}:8080"      # Weboberfläche
+      - "${GATEWAY_PORT:-8000}:8000"         # restic-Clients, HTTP (nur ohne TLS)
+      # Die HTTPS-Ports gelten innen wie außen identisch: Die Weiterleitung und die
+      # angezeigten URLs verwenden diesen Port (z. B. UI_TLS_PORT=443 für Standard-HTTPS).
+      - "${GATEWAY_TLS_PORT:-8444}:${GATEWAY_TLS_PORT:-8444}" # restic-Clients, HTTPS (nur mit TLS)
+      - "${UI_PORT:-8080}:8080"                                # Weboberfläche, HTTP (mit TLS: Weiterleitung)
+      - "${UI_TLS_PORT:-8443}:${UI_TLS_PORT:-8443}"            # Weboberfläche, HTTPS (nur mit TLS)
     networks:
       - backend
       - frontend

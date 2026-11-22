@@ -26,12 +26,14 @@ var staticFS embed.FS
 const cookieName = "rsui_session"
 
 type Config struct {
-	PublicURL    string // URL of the restic gateway as seen by clients
-	CookieSecure bool   // force the Secure flag (e.g. behind a TLS terminating proxy)
-	SessionTTL   time.Duration
-	Version      string
-	GatewayPort  string          // port of the restic gateway, for the displayed URLs
-	TLS          *tlsmgr.Manager // optional; enables the TLS settings API
+	PublicURL      string // URL of the restic gateway as seen by clients
+	CookieSecure   bool   // force the Secure flag (e.g. behind a TLS terminating proxy)
+	SessionTTL     time.Duration
+	Version        string
+	GatewayPort    string          // port of the plain-HTTP restic gateway, for the displayed URLs
+	GatewayTLSPort string          // port of the HTTPS restic gateway, used while TLS is active
+	UITLSPort      string          // port of the HTTPS web UI
+	TLS            *tlsmgr.Manager // optional; enables the TLS settings API
 }
 
 type Server struct {
@@ -211,7 +213,7 @@ func (s *Server) publicURL() string {
 	if s.cfg.TLS == nil {
 		return s.cfg.PublicURL
 	}
-	return s.cfg.TLS.AdjustPublicURL(s.cfg.PublicURL, s.cfg.GatewayPort)
+	return s.cfg.TLS.AdjustPublicURL(s.cfg.PublicURL, s.cfg.GatewayTLSPort)
 }
 
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
@@ -253,11 +255,13 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) me(w http.ResponseWriter, r *http.Request, u store.User, _ string) {
 	resp := map[string]any{
-		"user":        toDTO(u),
-		"publicUrl":   s.publicURL(),
-		"version":     s.cfg.Version,
-		"dataEnabled": s.scanner.Enabled(),
-		"grants":      s.store.GrantsFor(u.Name),
+		"user":           toDTO(u),
+		"publicUrl":      s.publicURL(),
+		"gatewayPort":    s.cfg.GatewayPort,
+		"gatewayTlsPort": s.cfg.GatewayTLSPort,
+		"version":        s.cfg.Version,
+		"dataEnabled":    s.scanner.Enabled(),
+		"grants":         s.store.GrantsFor(u.Name),
 	}
 	if s.scanner.Enabled() {
 		all, _, _ := s.scanner.Repos(false)

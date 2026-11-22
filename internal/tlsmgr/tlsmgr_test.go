@@ -234,25 +234,63 @@ func selfSigned(t *testing.T, names ...string) (certPEM, keyPEM []byte) {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: kd})
 }
 
-func TestDynamicListenerSwitchesToTLS(t *testing.T) {
-	m, err := New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
+// setEnabled flips the "enabled" setting like SetConfig does, without
+// starting a certificate run.
+func setEnabled(m *Manager, on bool) {
+	m.mu.Lock()
+	m.cfg.Enabled = on
+	m.notifyLocked()
+	m.mu.Unlock()
+}
+
+func freeAddr(t *testing.T) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		io.WriteString(w, "tls=")
-		if r.TLS != nil {
-			io.WriteString(w, "yes")
-		} else {
-			io.WriteString(w, "no")
+	defer ln.Close()
+	return ln.Addr().String()
+}
+
+func eventually(t *testing.T, what string, f func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if f() {
+			return
 		}
-	})}
-	go srv.Serve(m.Listener(ln))
-	defer srv.Close()
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timeout: %s", what)
+}
+
+func TestListenersFollowTLSState(t *testing.T) {
+	m, err := New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plainAddr, tlsAddr := freeAddr(t), freeAddr(t)
+	plainLn, err := m.ListenPlain(plainAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tlsLn, err := m.ListenTLS(tlsAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS != nil {
+			io.WriteString(w, "tls=yes")
+		} else {
+			io.WriteString(w, "tls=no")
+		}
+	})
+	for _, ln := range []net.Listener{plainLn, tlsLn} {
+		srv := &http.Server{Handler: h}
+		go srv.Serve(ln)
+		defer srv.Close()
+	}
 
 	get := func(url string) (string, error) {
 		c := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
@@ -266,39 +304,37 @@ func TestDynamicListenerSwitchesToTLS(t *testing.T) {
 		b, _ := io.ReadAll(resp.Body)
 		return string(b), nil
 	}
-	addr := ln.Addr().String()
+	plainOK := func() bool { b, err := get("http://" + plainAddr); return err == nil && b == "tls=no" }
+	plainDown := func() bool { _, err := get("http://" + plainAddr); return err != nil }
+	tlsOK := func() bool { b, err := get("https://" + tlsAddr); return err == nil && b == "tls=yes" }
+	tlsDown := func() bool { _, err := get("https://" + tlsAddr); return err != nil }
 
-	if body, err := get("http://" + addr); err != nil || body != "tls=no" {
-		t.Fatalf("plain before enabling: %q %v", body, err)
+	// No TLS: HTTP is served, the HTTPS port is closed.
+	if !plainOK() || !tlsDown() {
+		t.Fatal("before enabling: want plain up and TLS down")
 	}
 
-	// A certificate alone does not switch TLS on …
+	// A certificate alone does not switch TLS on ...
 	certPEM, keyPEM := selfSigned(t, "backup.example.com")
 	cfg := DefaultConfig()
 	cfg.Domains = []string{"backup.example.com"}
 	if err := m.install(cfg, &issued{certPEM: certPEM, keyPEM: keyPEM}); err != nil {
 		t.Fatal(err)
 	}
-	if body, err := get("http://" + addr); err != nil || body != "tls=no" {
-		t.Fatalf("plain with cert but disabled: %q %v", body, err)
+	time.Sleep(100 * time.Millisecond)
+	if !plainOK() || !tlsDown() {
+		t.Fatal("certificate but disabled: want plain up and TLS down")
 	}
-	// … enabling it does, without restart.
-	m.mu.Lock()
-	m.cfg.Enabled = true
-	m.mu.Unlock()
-	if body, err := get("https://" + addr); err != nil || body != "tls=yes" {
-		t.Fatalf("https after enabling: %q %v", body, err)
-	}
-	if body, err := get("http://" + addr); err == nil && body == "tls=no" {
-		t.Fatalf("plain HTTP must not be served while TLS is active: %q", body)
-	}
-	// Disabling goes back to plain.
-	m.mu.Lock()
-	m.cfg.Enabled = false
-	m.mu.Unlock()
-	if body, err := get("http://" + addr); err != nil || body != "tls=no" {
-		t.Fatalf("plain after disabling: %q %v", body, err)
-	}
+
+	// ... enabling it does, without restart: HTTPS opens, HTTP is released.
+	setEnabled(m, true)
+	eventually(t, "https up", tlsOK)
+	eventually(t, "plain down", plainDown)
+
+	// Disabling goes back to plain HTTP only.
+	setEnabled(m, false)
+	eventually(t, "plain up again", plainOK)
+	eventually(t, "https down again", tlsDown)
 
 	// The certificate survives a restart.
 	m2, err := New(m.dir)
@@ -307,6 +343,66 @@ func TestDynamicListenerSwitchesToTLS(t *testing.T) {
 	}
 	if m2.info == nil || len(m2.info.Domains) != 1 || m2.info.Domains[0] != "backup.example.com" {
 		t.Fatalf("certificate not reloaded: %+v", m2.info)
+	}
+}
+
+func TestListenPlainFailsFastWhenPortBusy(t *testing.T) {
+	m, _ := New(t.TempDir())
+	busy, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer busy.Close()
+	if _, err := m.ListenPlain(busy.Addr().String()); err == nil {
+		t.Fatal("expected an error for a port in use")
+	}
+	// The HTTPS listener is not bound while TLS is off, so a busy port is no error yet.
+	ln, err := m.ListenTLS(busy.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.Close()
+}
+
+func TestRedirectToHTTPSAndDenyPlain(t *testing.T) {
+	m, _ := New(t.TempDir())
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "app") })
+	redirect := m.RedirectToHTTPS(next, "8443")
+	deny := m.DenyPlain(next)
+	do := func(h http.Handler, host, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "http://"+host+path, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+
+	if w := do(redirect, "nas:8080", "/x"); w.Body.String() != "app" {
+		t.Fatalf("TLS off: no redirect expected, got %d %q", w.Code, w.Body.String())
+	}
+	if w := do(deny, "nas:8000", "/x"); w.Body.String() != "app" {
+		t.Fatalf("TLS off: gateway must work, got %d", w.Code)
+	}
+
+	certPEM, keyPEM := selfSigned(t, "backup.example.com", "*.lan.example.com")
+	_ = m.install(DefaultConfig(), &issued{certPEM: certPEM, keyPEM: keyPEM})
+	setEnabled(m, true)
+
+	for host, want := range map[string]string{
+		"backup.example.com:8080": "https://backup.example.com:8443/a/b?c=d",
+		"backup.example.com":      "https://backup.example.com:8443/a/b?c=d",
+		"nas.lan.example.com:80":  "https://nas.lan.example.com:8443/a/b?c=d",
+		"192.168.1.5:8080":        "https://backup.example.com:8443/a/b?c=d", // not covered by the certificate
+	} {
+		w := do(redirect, host, "/a/b?c=d")
+		if w.Code != http.StatusTemporaryRedirect || w.Header().Get("Location") != want {
+			t.Errorf("host %q: got %d %q, want %q", host, w.Code, w.Header().Get("Location"), want)
+		}
+	}
+	if w := do(redirect, "backup.example.com:8080", "/healthz"); w.Body.String() != "app" {
+		t.Fatalf("/healthz must not be redirected: %d", w.Code)
+	}
+	if w := do(deny, "backup.example.com:8000", "/x"); w.Code != http.StatusForbidden || w.Body.String() == "app" {
+		t.Fatalf("plain gateway must be refused while TLS is active: %d", w.Code)
 	}
 }
 
@@ -376,7 +472,7 @@ func TestSetConfigKeepsAPIKey(t *testing.T) {
 
 func TestAdjustPublicURL(t *testing.T) {
 	m, _ := New(t.TempDir())
-	if got := m.AdjustPublicURL("http://nas:8000", "8000"); got != "http://nas:8000" {
+	if got := m.AdjustPublicURL("http://nas:8000", "8444"); got != "http://nas:8000" {
 		t.Fatalf("inactive TLS must not change the URL: %q", got)
 	}
 	certPEM, keyPEM := selfSigned(t, "backup.example.com", "*.lan.example.com")
@@ -385,11 +481,12 @@ func TestAdjustPublicURL(t *testing.T) {
 	for in, want := range map[string]string{
 		"":                                 "",
 		"https://x.example.com/rest":       "https://x.example.com/rest",
-		"http://backup.example.com:8000":   "https://backup.example.com:8000",
-		"http://nas.lan.example.com:8000/": "https://nas.lan.example.com:8000",
-		"http://truenas.local:8000":        "https://backup.example.com:8000",
+		"http://backup.example.com:8000":   "https://backup.example.com:8444",
+		"http://nas.lan.example.com:8000/": "https://nas.lan.example.com:8444",
+		"http://truenas.local:8000":        "https://backup.example.com:8444",
+		"http://truenas.local:8000/restic": "https://backup.example.com:8444/restic",
 	} {
-		if got := m.AdjustPublicURL(in, "8000"); got != want {
+		if got := m.AdjustPublicURL(in, "8444"); got != want {
 			t.Errorf("AdjustPublicURL(%q)=%q, want %q", in, got, want)
 		}
 	}

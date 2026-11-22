@@ -16,11 +16,15 @@ type tlsView struct {
 	Config    tlsmgr.Config `json:"config"`
 	APIKeySet bool          `json:"apiKeySet"`
 	Status    tlsmgr.Status `json:"status"`
+	// Ports of the HTTPS listeners, for the hints in the admin UI.
+	UITLSPort      string `json:"uiTlsPort"`
+	GatewayTLSPort string `json:"gatewayTlsPort"`
 }
 
 func (s *Server) tlsState() tlsView {
 	cfg := s.cfg.TLS.Config()
-	v := tlsView{APIKeySet: cfg.PowerDNS.APIKey != "", Status: s.cfg.TLS.Status()}
+	v := tlsView{APIKeySet: cfg.PowerDNS.APIKey != "", Status: s.cfg.TLS.Status(),
+		UITLSPort: s.cfg.UITLSPort, GatewayTLSPort: s.cfg.GatewayTLSPort}
 	cfg.PowerDNS.APIKey = ""
 	v.Config = cfg
 	return v

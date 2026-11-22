@@ -23,6 +23,10 @@ restic-Client ──Basic-Auth──► ui :8000  (Gateway)            ──►
                                • prüft Modus (GET/POST/DELETE)    (nur internes Docker-Netz,
                                • setzt X-Restic-User = Besitzer    kein veröffentlichter Port)
 Browser ─────────────────────► ui :8080  (Weboberfläche)
+
+Mit TLS (getrennte Ports, siehe „TLS / Let's Encrypt“):
+restic-Client ──HTTPS──► ui :8444  (Gateway)      ui :8000 ist dann geschlossen
+Browser ───────HTTPS──► ui :8443  (Oberfläche)    ui :8080 leitet auf :8443 um
 ```
 
 rest-server kann Freigaben selbst nicht abbilden: Im `--private-repos`-Modus darf
@@ -103,14 +107,19 @@ services:
       ADMIN_PASSWORD: "bitte-ändern"
       PUBLIC_URL: "http://truenas.local:8000"
       BACKEND_URL: http://rest-server:8000
+      # optional, Standardwerte:
+      # UI_TLS_LISTEN: ":8443"
+      # GATEWAY_TLS_LISTEN: ":8444"
       PROXY_AUTH_HEADER: X-Restic-User
       TZ: Europe/Berlin
     volumes:
       - /mnt/tank/apps/restic/config:/config
       - /mnt/tank/apps/restic/data:/data:ro
     ports:
-      - "8000:8000"
-      - "8080:8080"
+      - "8000:8000"   # Gateway, HTTP (nur ohne TLS)
+      - "8444:8444"   # Gateway, HTTPS (nur mit TLS)
+      - "8080:8080"   # Oberfläche, HTTP (mit TLS: Weiterleitung)
+      - "8443:8443"   # Oberfläche, HTTPS (nur mit TLS)
     networks: [backend, frontend]
 networks:
   backend:
@@ -128,8 +137,21 @@ Für HTTPS gibt es zwei Wege: das eingebaute Let's-Encrypt-TLS (Abschnitt
 
 ## TLS / Let's Encrypt
 
-Weboberfläche (`:8080`) **und** restic-Gateway (`:8000`) können direkt im Container
-per TLS abgesichert werden. Das Zertifikat kommt von Let's Encrypt (oder einer
+Weboberfläche **und** restic-Gateway können direkt im Container per TLS abgesichert
+werden. HTTP und HTTPS laufen auf **getrennten Ports**:
+
+| Port (Standard) | Dienst | Ohne TLS | Mit TLS |
+|-----------------|--------|----------|---------|
+| `8080` (`UI_LISTEN`) | Oberfläche, HTTP | Oberfläche | **Weiterleitung** (307) auf `https://<Domain>:8443` |
+| `8443` (`UI_TLS_LISTEN`) | Oberfläche, HTTPS | geschlossen | Oberfläche |
+| `8000` (`GATEWAY_LISTEN`) | restic-Gateway, HTTP | Gateway | **geschlossen** (Port wird freigegeben) |
+| `8444` (`GATEWAY_TLS_LISTEN`) | restic-Gateway, HTTPS | geschlossen | Gateway |
+
+Das Umschalten geschieht zur Laufzeit, ein Neustart ist nicht nötig. Beim Gateway wird
+der HTTP-Port wirklich geschlossen (Verbindung abgelehnt); bereits offene
+Keep-Alive-Verbindungen bekommen nur noch `403`. Der Container-Healthcheck nutzt
+`http://127.0.0.1:8080/healthz`, der von der Weiterleitung ausgenommen ist.
+Das Zertifikat kommt von Let's Encrypt (oder einer
 anderen ACME-CA) und wird per **DNS-01-Challenge über die PowerDNS-API** ausgestellt –
 es muss also kein Port aus dem Internet erreichbar sein, und Wildcards
 (`*.example.com`) sind möglich. Alles wird in der Oberfläche unter **TLS** eingestellt:
@@ -150,12 +172,18 @@ erneut versucht, das Protokoll des letzten Laufs steht in der Oberfläche.
 
 Wichtig zu wissen:
 
-- **Umschalten ohne Neustart:** TLS wird erst aktiv, wenn ein Zertifikat vorliegt. Danach sind
-  beide Ports **nur noch per HTTPS** erreichbar (HTTP-Anfragen werden mit 400 abgelehnt).
-  Bereits offene Verbindungen bleiben bis zu ihrem Ende unverschlüsselt.
-  restic-Clients müssen auf `rest:https://…` umgestellt werden; die in der Oberfläche
-  angezeigten URLs passen sich an (bei gesetzter `PUBLIC_URL` mit `http://` wird die erste
-  Domain bzw. derselbe Host mit `https://` verwendet).
+- **Umschalten ohne Neustart:** TLS wird erst aktiv, wenn ein Zertifikat vorliegt. Danach ist das
+  Gateway **nur noch per HTTPS** auf `:8444` erreichbar, die Oberfläche auf `:8443`
+  (`:8080` leitet dorthin um). restic-Clients müssen auf `rest:https://<Domain>:8444/…`
+  umgestellt werden; die in der Oberfläche angezeigten URLs passen sich an (bei gesetzter
+  `PUBLIC_URL` mit `http://` wird ein vom Zertifikat abgedeckter Host mit `https://` und dem
+  HTTPS-Port verwendet, sonst die erste Domain des Zertifikats). Der Zielhost der Weiterleitung
+  ist der Host der Anfrage, falls das Zertifikat ihn abdeckt, sonst die erste Domain des Zertifikats.
+- Die Ports `8443`/`8444` müssen in Docker/TrueNAS veröffentlicht sein (siehe `docker-compose.yml`).
+  Weiterleitung und angezeigte URLs verwenden den Port aus `UI_TLS_LISTEN`/`GATEWAY_TLS_LISTEN`
+  – veröffentliche ihn daher **mit derselben Nummer** nach außen (kein Mapping wie `9443:8443`).
+  Die mitgelieferte Compose-Datei macht das über `UI_TLS_PORT`/`GATEWAY_TLS_PORT` in der `.env`
+  (z. B. `UI_TLS_PORT=443`).
 - Der Hostname, unter dem Clients und Browser den Server erreichen, muss im Zertifikat
   stehen und auf den Server zeigen.
 - Der Container braucht ausgehenden Zugriff auf die ACME-CA (HTTPS) und auf die PowerDNS-API.
@@ -193,7 +221,8 @@ webserver-allow-from=<Netz der UI, z. B. 172.16.0.0/12>
 | `PROXY_AUTH_HEADER`    | `X-Restic-User`             | Muss zu `--proxy-auth-username` passen |
 | `CONFIG_DIR`           | `/config`                   | Enthält `users.json` (Benutzer, Hashes, Freigaben) sowie `tls.json` und `tls/` (TLS-Einstellungen, Zertifikat, Schlüssel) |
 | `DATA_DIR`             | `/data`                     | rest-server-Daten (read-only) für die Statistik; optional |
-| `UI_LISTEN` / `GATEWAY_LISTEN` | `:8080` / `:8000`   | Listen-Adressen |
+| `UI_LISTEN` / `GATEWAY_LISTEN` | `:8080` / `:8000`   | Listen-Adressen für HTTP (Gateway-HTTP nur ohne TLS; Oberfläche leitet mit TLS um) |
+| `UI_TLS_LISTEN` / `GATEWAY_TLS_LISTEN` | `:8443` / `:8444` | Listen-Adressen für HTTPS (nur mit TLS offen) |
 | `TLS_CERT` / `TLS_KEY` | –                           | Optional: festes Zertifikat (PEM). Hat Vorrang vor Let's Encrypt; die TLS-Einstellungen in der Oberfläche sind dann gesperrt |
 | `COOKIE_SECURE`        | `false`                     | Secure-Flag für das Session-Cookie erzwingen. Bei TLS im Container wird es automatisch gesetzt; nur nötig, wenn ein Reverse Proxy TLS terminiert |
 | `SESSION_TTL`          | `12h`                       | Gültigkeit einer Anmeldung |

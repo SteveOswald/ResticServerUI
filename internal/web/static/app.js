@@ -108,7 +108,11 @@ async function copyText(text) {
 
 function gatewayBase() {
   if (state.me && state.me.publicUrl) return state.me.publicUrl;
-  return `${location.protocol}//${location.hostname}:8000`;
+  // No PUBLIC_URL: same host as the UI, with the HTTP or HTTPS gateway port.
+  const tls = location.protocol === 'https:';
+  const me = state.me || {};
+  const port = tls ? (me.gatewayTlsPort || '8444') : (me.gatewayPort || '8000');
+  return `${location.protocol}//${location.hostname}:${port}`;
 }
 
 function repoUrl(user, path, password) {
@@ -703,7 +707,7 @@ async function renderTLS(main) {
           h('label', { class: 'check' }, h('input', { type: 'checkbox', name: 'enabled', checked: f.enabled }),
             h('span', {}, h('strong', {}, 'TLS aktivieren'), ' – Weboberfläche und restic-Gateway werden verschlüsselt')),
           field('Domains', h('textarea', { name: 'domains', rows: 3, spellcheck: 'false', placeholder: 'backup.example.com' }, (f.domains || []).join('\n')),
-            'Eine pro Zeile. Wildcards wie *.example.com sind möglich (DNS-Challenge). Ein Zertifikat gilt für beide Ports.'),
+            'Eine pro Zeile. Wildcards wie *.example.com sind möglich (DNS-Challenge). Ein Zertifikat gilt für Oberfläche und restic-Gateway.'),
           field('E-Mail-Adresse', text('email', f.email, { type: 'text', placeholder: 'admin@example.com' }),
             'Für Ablaufwarnungen der Zertifizierungsstelle (empfohlen).'),
           field('Zertifizierungsstelle', caSel), customField,
@@ -734,18 +738,21 @@ async function renderTLS(main) {
       h('div', { class: 'callout' },
         'Ablauf: Für jede Domain wird per PowerDNS-API ein TXT-Eintrag ', h('code', {}, '_acme-challenge.<domain>'),
         ' gesetzt, von Let’s Encrypt geprüft und danach wieder entfernt. Es muss kein Port aus dem Internet erreichbar sein. ',
-        'Erst wenn ein Zertifikat vorliegt, schaltet der Server um: Danach sind beide Ports nur noch per HTTPS erreichbar – restic-Clients benötigen ',
+        'Erst wenn ein Zertifikat vorliegt, schaltet der Server um: HTTPS läuft auf eigenen Ports (Oberfläche ',
+        h('code', {}, ':' + (data.uiTlsPort || '8443')), ', restic ', h('code', {}, ':' + (data.gatewayTlsPort || '8444')),
+        '). Die Oberfläche leitet vom HTTP-Port auf HTTPS um; der HTTP-Port des restic-Gateways wird geschlossen – restic-Clients benötigen ',
         h('code', {}, 'rest:https://…'), '.'),
       form)));
 }
 
 function tlsActiveHint(d, connectionLost) {
   const dom = (d.config.domains || []).find((n) => !n.startsWith('*.')) || (d.status.cert && d.status.cert.domains[0]);
-  const url = dom ? `https://${dom}${location.port ? ':' + location.port : ''}/` : null;
+  const port = d.uiTlsPort && d.uiTlsPort !== '443' ? ':' + d.uiTlsPort : '';
+  const url = dom ? `https://${dom}${port}/` : null;
   openDialog({
     title: connectionLost ? 'Verbindung unterbrochen – TLS ist vermutlich aktiv' : 'TLS ist jetzt aktiv',
     submitLabel: 'Schließen', noCancel: true,
-    body: [h('p', {}, 'Neue Verbindungen werden verschlüsselt. Diese Seite ist noch über HTTP geladen – öffne die Oberfläche künftig über HTTPS:'),
+    body: [h('p', {}, 'Neue Verbindungen werden verschlüsselt. Diese Seite ist noch über HTTP geladen (der HTTP-Port leitet künftig automatisch um) – öffne die Oberfläche über HTTPS:'),
       url ? codeBox(url) : null,
       h('p', { class: 'hint' }, 'Passe auch die URLs in deinen restic-Clients an (rest:https://…). Bei Problemen kann die Datei tls.json im Konfigurationsverzeichnis gelöscht werden – dann läuft nach einem Neustart alles wieder unverschlüsselt.')],
   });
